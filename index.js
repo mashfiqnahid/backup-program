@@ -1,189 +1,174 @@
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
 const axios = require('axios');
-const FormData = require('form-data');
-const {
-    user,
-    pass,
-    CLIENT_ID,
-    CLIENT_SECRET,
-    REFRESH_TOKEN,
-    FILE_PATH,
-    FILE_NAME,
-    G_FOLDER_ID
-} = require('./config');
+const cron = require('node-cron');
+const { runCleanup } = require('./cleanup');
 
+// Load configuration
+const config = require('./config');
 
-const backupDir = path.join(FILE_PATH);
-const zipFileName = path.join(FILE_PATH, FILE_NAME);
-// Function to dump MySQL databases using exec
-async function dumpMySQLDatabases() {
-    const databases = ['publication_main', 'publication_kg', 'publication_notes'];
+const CLIENT_ID = config.CLIENT_ID;
+const CLIENT_SECRET = config.CLIENT_SECRET;
+const REFRESH_TOKEN = config.REFRESH_TOKEN;
 
-    for (const db of databases) {
-        const command = `f:\\xampp\\mysql\\bin\\mysqldump --opt --user="${user}" --password="${pass}" ${db} > "${path.join(backupDir, `${db}.sql`)}"`;
+// Environmental and optional parameters with default values
+const CLEANUP_CRON_SCHEDULE = config.CLEANUP_CRON_SCHEDULE || '0 * * * *';
+const CLEANUP_RUN_ON_STARTUP = config.CLEANUP_RUN_ON_STARTUP !== undefined ? config.CLEANUP_RUN_ON_STARTUP : true;
+
+function getTimestamp() {
+    return new Date().toISOString().replace('T', ' ').substring(0, 19);
+}
+
+function log(message) {
+    console.log(`[${getTimestamp()}] [INFO] ${message}`);
+}
+
+function logError(message) {
+    console.error(`[${getTimestamp()}] [ERROR] ${message}`);
+}
+
+function logWarn(message) {
+    console.warn(`[${getTimestamp()}] [WARN] ${message}`);
+}
+
+// Helper to update the refresh token inside config.js safely
+function updateConfigRefreshToken(newToken) {
+    const configPath = path.join(__dirname, 'config.js');
+    if (!fs.existsSync(configPath)) {
+        logError(`config.js not found at ${configPath}`);
+        return;
+    }
+    let content = fs.readFileSync(configPath, 'utf8');
+    
+    const regex = /(const\s+REFRESH_TOKEN\s*=\s*['"])([^'"]*)(['"])/;
+    if (regex.test(content)) {
+        content = content.replace(regex, `$1${newToken}$3`);
+        fs.writeFileSync(configPath, content, 'utf8');
+    } else {
+        logWarn('Could not automatically replace REFRESH_TOKEN in config.js. Please update it manually.');
+        console.log(`New Refresh Token: ${newToken}`);
+    }
+}
+
+// Google OAuth Login Wizard
+async function runLoginWizard() {
+    log('====================================================');
+    log('Google Drive Authentication Wizard');
+    log('====================================================');
+    
+    if (!CLIENT_ID || !CLIENT_SECRET) {
+        logError('Error: CLIENT_ID or CLIENT_SECRET is missing in config.js.');
+        process.exit(1);
+    }
+
+    const redirectUri = 'http://localhost:8585';
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=https://www.googleapis.com/auth/drive&access_type=offline&prompt=consent`;
+
+    console.log('\n1. Open this link in your web browser:\n');
+    console.log(`   \x1b[36m${authUrl}\x1b[0m\n`);
+    console.log('2. Sign in and grant access to Google Drive.');
+    console.log('3. Your browser will redirect to a page that says "This site can\'t be reached" (http://localhost:8585...).');
+    console.log('4. Copy the entire URL from the browser address bar (or just the code after "?code=") and paste it below.');
+
+    const readline = require('readline');
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    rl.question('\nPaste the redirect URL or authorization code here: ', async (code) => {
+        rl.close();
+        let cleanCode = code.trim();
+
+        if (cleanCode.includes('code=')) {
+            try {
+                const tempUrl = cleanCode.startsWith('http') ? cleanCode : `http://localhost/${cleanCode}`;
+                const urlObj = new URL(tempUrl);
+                const codeParam = urlObj.searchParams.get('code');
+                if (codeParam) {
+                    cleanCode = codeParam;
+                }
+            } catch (e) {
+                // Keep cleanCode as is if parsing fails
+            }
+        }
+
+        if (!cleanCode) {
+            logError('Error: No authorization code entered.');
+            process.exit(1);
+        }
 
         try {
-            // Execute the command
-            await new Promise((resolve, reject) => {
-                exec(command, (error, stdout, stderr) => {
-                    if (error) {
-                        reject(`Error dumping database ${db}: ${error.message}`);
-                    } else if (stderr) {
-                        reject(`stderr: ${stderr}`);
-                    } else {
-                        console.log(`Database ${db} dumped successfully.`);
-                        resolve(stdout);
-                    }
-                });
+            log('Exchanging authorization code for refresh token...');
+            const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+                client_id: CLIENT_ID,
+                client_secret: CLIENT_SECRET,
+                code: cleanCode,
+                grant_type: 'authorization_code',
+                redirect_uri: redirectUri
             });
-        } catch (error) {
-            console.error(error);
-        }
-    }
-}
 
-// Function to zip SQL files into one backup file
-async function zipBackupFiles() {
-    const command = `"C:\\Program Files\\7-Zip\\7z.exe" a -tzip -r ${FILE_NAME} *.sql`;
-
-    return new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                reject(`Error Deleting ${FILE_NAME} : ${error.message}`);
-            } else if (stderr) {
-                reject(`stderr: ${stderr}`);
-            } else {
-                console.log(`${FILE_NAME} file created successfully.`);
-                resolve(stdout);
+            const { refresh_token } = tokenRes.data;
+            if (!refresh_token) {
+                logWarn('Warning: No refresh token returned. If you are re-authenticating, you might need to revoke access first at https://myaccount.google.com/permissions so Google returns a refresh token.');
             }
-        });
+            
+            const finalToken = refresh_token || tokenRes.data.access_token;
+            updateConfigRefreshToken(finalToken);
+            log('Authentication completed successfully! Your token has been updated in config.js.');
+            process.exit(0);
+        } catch (err) {
+            const detail = err.response && err.response.data ? JSON.stringify(err.response.data) : err.message;
+            logError(`Failed to exchange code for token: ${detail}`);
+            process.exit(1);
+        }
     });
 }
 
-// Function to get access token from Google OAuth
-async function getAccessToken() {
-    try {
-        const response = await axios.post('https://oauth2.googleapis.com/token', {
-            client_id: CLIENT_ID,
-            client_secret: CLIENT_SECRET,
-            refresh_token: REFRESH_TOKEN,
-            grant_type: 'refresh_token',
-        });
-        return response.data.access_token;
-    } catch (error) {
-        throw new Error('Error getting access token: ' + error.message);
-    }
-}
-
-// Function to check for existing file in Google Drive
-async function checkExistingFile(accessToken) {
-    const queryString = encodeURIComponent(`name = "${FILE_NAME}" and '${G_FOLDER_ID}' in parents`);
-    const url = `https://www.googleapis.com/drive/v3/files?q=${queryString}`
-    const token = `Bearer ${accessToken}`
-    // console.log(JSON.stringify({ url, token },null, 2))
-    try {
-        const response = await axios.get(url, {
-            headers: { Authorization: token },
-        });
-        if (response.data.files && response.data.files.length > 0) {
-            return response.data.files[0].id;
-        }
-        return null;
-    } catch (error) {
-        throw new Error('Error checking for existing file: ' + error.message);
-    }
-}
-
-// Function to delete existing file on Google Drive
-async function deleteExistingFile(fileId, accessToken) {
-    try {
-        await axios.delete(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        });
-        console.log('Existing file deleted.');
-    } catch (error) {
-        console.error('Error deleting existing file: ' + error.message);
-    }
-}
-
-// Function to upload new file to Google Drive
-async function uploadFileToDrive(accessToken) {
-    const form = new FormData();
-    form.append('metadata', JSON.stringify({
-        name: FILE_NAME,
-        parents: [G_FOLDER_ID],
-    }), {
-        contentType: 'application/json',
+// Handle execution modes
+const args = process.argv.slice(2);
+if (args.includes('--login')) {
+    runLoginWizard();
+} else if (args.includes('--once')) {
+    log('Executing single manual cleanup run (--once flag detected)...');
+    runCleanup().then(() => {
+        log('Manual cleanup finished.');
+        process.exit(0);
+    }).catch((err) => {
+        logError(`Manual cleanup run failed: ${err.message}`);
+        process.exit(1);
     });
-    form.append('file', fs.createReadStream(zipFileName));
+} else {
+    // Daemon / PM2 Service mode
+    log('Google Drive Smart Cleanup Service initializing...');
+    log(`Cron Schedule: "${CLEANUP_CRON_SCHEDULE}"`);
+    log(`Target Folders: ${JSON.stringify(config.CLEANUP_FOLDER_IDS || [])}`);
 
-    try {
-        const response = await axios.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', form, {
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                ...form.getHeaders(),
-            },
-        });
-        console.log('File uploaded successfully!');
-    } catch (error) {
-        throw new Error('Error uploading file: ' + error.message);
+    if (!cron.validate(CLEANUP_CRON_SCHEDULE)) {
+        logError(`Invalid cron expression: "${CLEANUP_CRON_SCHEDULE}". Please verify config.js.`);
+        process.exit(1);
     }
-}
-// Function to delete the backup file (FILE_NAME)
-async function deleteBackupFile() {
-    try {
-        if (fs.existsSync(zipFileName)) {
-            // Delete the backup file if it exists
-            fs.unlinkSync(zipFileName);
-            console.log('Backup file deleted successfully.');
-        } else {
-            console.log('Backup file does not exist.');
-        }
-    } catch (error) {
-        console.error('Error deleting backup file: ' + error.message);
+
+    if (CLEANUP_RUN_ON_STARTUP) {
+        log('Triggering initial cleanup on service startup...');
+        runCleanup().catch(err => logError(`Startup cleanup failed: ${err.message}`));
     }
+
+    cron.schedule(CLEANUP_CRON_SCHEDULE, () => {
+        log(`Cron trigger fired for schedule "${CLEANUP_CRON_SCHEDULE}".`);
+        runCleanup();
+    });
+
+    log('Cleanup service is active and waiting for next scheduled run.');
+
+    // Graceful process shutdown handling
+    process.on('SIGINT', () => {
+        log('Received SIGINT signal. Shutting down cleanup service gracefully...');
+        process.exit(0);
+    });
+
+    process.on('SIGTERM', () => {
+        log('Received SIGTERM signal. Shutting down cleanup service gracefully...');
+        process.exit(0);
+    });
 }
-// Main function to execute all tasks
-async function backup() {
-    try {
-        console.log('Starting backup process...');
-
-        // Dump MySQL databases
-        await dumpMySQLDatabases();
-
-        // Zip the SQL files
-        await zipBackupFiles();
-
-        // Get Google Drive access token
-        const accessToken = await getAccessToken();
-        console.log('Access token obtained.');
-
-        // Check for existing file on Google Drive
-        const existingFileId = await checkExistingFile(accessToken);
-
-        // If file exists, delete it
-        if (existingFileId) {
-            await deleteExistingFile(existingFileId, accessToken);
-        }
-
-        // Upload the new file to Google Drive
-        await uploadFileToDrive(accessToken);
-
-        // Clean up SQL files
-        fs.readdirSync(backupDir).forEach(file => {
-            if (file.endsWith('.sql')) {
-                fs.unlinkSync(path.join(backupDir, file));
-            }
-        });
-        await deleteBackupFile()
-
-        console.log('Backup process completed.');
-    } catch (error) {
-        console.error('Error during backup process: ' + error.message);
-    }
-}
-
-// Execute backup
-backup();

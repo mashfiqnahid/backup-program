@@ -1,20 +1,27 @@
 // config.sample.js
-const user = 'your-username-here';
-const pass = 'your-password-here';
 const CLIENT_ID = 'your-client-id-here';
 const CLIENT_SECRET = 'your-client-secret-here';
 const REFRESH_TOKEN = 'your-refresh-token-here';
-const FILE_PATH = 'your-file-path-here';
-const FILE_NAME = 'your-file-name-here';
-const G_FOLDER_ID = 'your-google-folder-id-here';
+
+// Smart Cleanup Settings
+const CLEANUP_FOLDER_IDS = [
+  'your-google-folder-id-here',
+  'another-google-folder-id-here'
+];
+const CLEANUP_RETENTION_HOURS = 504; // Keep files from last 3 weeks (504 hours, configurable)
+const CLEANUP_MIN_RETAIN = 3; // Keep at least X files in each folder to prevent deleting all files
+const CLEANUP_CRON_SCHEDULE = '0 * * * *'; // Run cleanup hourly
+const CLEANUP_RUN_ON_STARTUP = true; // Run immediate cleanup on service startup
 
 module.exports = {
-  user,
-  pass,
   CLIENT_ID,
   CLIENT_SECRET,
   REFRESH_TOKEN,
-  FILE_PATH,
-  FILE_NAME,
-  G_FOLDER_ID
+  CLEANUP_FOLDER_IDS,
+  CLEANUP_RETENTION_HOURS,
+  CLEANUP_MIN_RETAIN,
+  CLEANUP_CRON_SCHEDULE,
+  CLEANUP_RUN_ON_STARTUP
 };
+
+
